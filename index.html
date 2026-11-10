@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>5×5五目並べ ミニマックスAI対戦</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .board-cell {
+      border: 1px solid #4b5563;
+      background: #1f2937;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      transition: background 0.1s;
+      font-size: 22px;
+      position: relative;
+    }
+    .board-cell:hover { background: #374151; }
+    .board-cell.win-cell { background: #14532d !important; }
+    .board-cell.hint-cell { background: #1e3a5f; }
+    #board { display: grid; gap: 2px; }
+    .thinking-dot { animation: blink 0.8s infinite; display:inline-block; }
+    @keyframes blink { 0%,100%{opacity:0.2} 50%{opacity:1} }
+  </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex flex-col items-center py-6 px-2">
+  <h1 class="text-2xl font-bold mb-2 text-indigo-400">⬛ 五目並べ ミニマックスAI</h1>
+
+  <div class="flex gap-3 mb-4 flex-wrap justify-center items-center text-sm">
+    <div class="flex items-center gap-2">
+      <label class="text-gray-300">グリッド:</label>
+      <select id="grid-size" class="bg-gray-700 text-white rounded px-2 py-1 border border-gray-600">
+        <option value="5">5×5</option>
+        <option value="7">7×7</option>
+        <option value="9" selected>9×9</option>
+      </select>
+    </div>
+    <div class="flex items-center gap-2">
+      <label class="text-gray-300">あなた:</label>
+      <select id="player-side" class="bg-gray-700 text-white rounded px-2 py-1 border border-gray-600">
+        <option value="1">⬛ 先手（黒）</option>
+        <option value="-1">⬜ 後手（白）</option>
+      </select>
+    </div>
+    <div class="flex items-center gap-2">
+      <label class="text-gray-300">難易度:</label>
+      <select id="difficulty" class="bg-gray-700 text-white rounded px-2 py-1 border border-gray-600">
+        <option value="1">Easy (depth 1)</option>
+        <option value="3" selected>Medium (depth 3)</option>
+        <option value="5">Hard (depth 5)</option>
+      </select>
+    </div>
+    <button id="btn-new" class="bg-indigo-700 hover:bg-indigo-600 px-4 py-1 rounded font-semibold transition">新しいゲーム</button>
+  </div>
+
+  <div class="flex gap-6 mb-3 text-sm">
+    <div class="bg-gray-800 rounded px-3 py-1">⬛ 勝: <span id="win-black" class="text-indigo-400 font-bold">0</span></div>
+    <div id="turn-box" class="bg-gray-800 rounded px-3 py-1">⬛ の手番</div>
+    <div class="bg-gray-800 rounded px-3 py-1">⬜ 勝: <span id="win-white" class="text-indigo-400 font-bold">0</span></div>
+  </div>
+
+  <div id="board" class="mb-4 shadow-xl"></div>
+  <div id="status-msg" class="text-sm text-gray-300 mb-2"></div>
+
+  <script>
+    const EMPTY=0, BLACK=1, WHITE=-1;
+    let N, board, currentTurn, playerColor, aiColor, depth, gameOver, aiThinking;
+    let winBlack=0, winWhite=0;
+    let winLine=[];
+
+    // Load stats from localStorage
+    function loadStats() {
+      const s=localStorage.getItem('gomoku-stats');
+      if (s) { const p=JSON.parse(s); winBlack=p.b||0; winWhite=p.w||0; }
+      document.getElementById('win-black').textContent=winBlack;
+      document.getElementById('win-white').textContent=winWhite;
+    }
+    function saveStats() {
+      localStorage.setItem('gomoku-stats',JSON.stringify({b:winBlack,w:winWhite}));
+    }
+
+    function newGame() {
+      N=parseInt(document.getElementById('grid-size').value);
+      playerColor=parseInt(document.getElementById('player-side').value);
+      aiColor=-playerColor;
+      depth=parseInt(document.getElementById('difficulty').value);
+      board=Array.from({length:N},()=>new Array(N).fill(EMPTY));
+      currentTurn=BLACK; gameOver=false; aiThinking=false; winLine=[];
+      document.getElementById('turn-box').textContent=currentTurn===BLACK?'⬛ の手番':'⬜ の手番';
+      setStatus('');
+      renderBoard();
+      if (currentTurn===aiColor) scheduleAI();
+    }
+
+    function renderBoard(hoverR=-1, hoverC=-1) {
+      const boardEl=document.getElementById('board');
+      const cellSize=N<=5?60:N<=7?52:44;
+      boardEl.style.gridTemplateColumns=`repeat(${N},${cellSize}px)`;
+      boardEl.innerHTML='';
+      for (let r=0;r<N;r++) for (let c=0;c<N;c++) {
+        const cell=document.createElement('div');
+        cell.className='board-cell';
+        cell.style.width=cellSize+'px';
+        cell.style.height=cellSize+'px';
+        if (winLine.some(([wr,wc])=>wr===r&&wc===c)) cell.classList.add('win-cell');
+        if (board[r][c]===BLACK) cell.textContent='⬛';
+        else if (board[r][c]===WHITE) cell.textContent='⬜';
+        else {
+          if (!gameOver && currentTurn===playerColor && !aiThinking) {
+            cell.addEventListener('click',()=>onPlayerClick(r,c));
+            if (r===hoverR&&c===hoverC) cell.classList.add('hint-cell');
+            cell.addEventListener('mouseenter',()=>renderBoard(r,c));
+            cell.addEventListener('mouseleave',()=>renderBoard());
+          }
+        }
+        boardEl.appendChild(cell);
+      }
+    }
+
+    function checkWin(b, lastR, lastC, color) {
+      const DIRS5=[[0,1],[1,0],[1,1],[1,-1]];
+      for (const [dr,dc] of DIRS5) {
+        const line=[[lastR,lastC]];
+        for (let d=1;d<5;d++) {
+          const nr=lastR+dr*d,nc=lastC+dc*d;
+          if (nr<0||nr>=N||nc<0||nc>=N||b[nr][nc]!==color) break;
+          line.push([nr,nc]);
+        }
+        for (let d=1;d<5;d++) {
+          const nr=lastR-dr*d,nc=lastC-dc*d;
+          if (nr<0||nr>=N||nc<0||nc>=N||b[nr][nc]!==color) break;
+          line.push([nr,nc]);
+        }
+        if (line.length>=5) return line;
+      }
+      return null;
+    }
+
+    function isFull(b) { return b.every(row=>row.every(c=>c!==EMPTY)); }
+
+    // Evaluation function
+    function evalLine(b, color, r, c, dr, dc) {
+      let mine=0, opp=0;
+      for (let d=-4;d<=4;d++) {
+        const nr=r+dr*d,nc=c+dc*d;
+        if (nr<0||nr>=N||nc<0||nc>=N) continue;
+        if (b[nr][nc]===color) mine++;
+        else if (b[nr][nc]===-color) opp++;
+      }
+      return mine - opp;
+    }
+
+    function scoreBoard(b, color) {
+      let score=0;
+      const DIRS=[[0,1],[1,0],[1,1],[1,-1]];
+      for (let r=0;r<N;r++) for (let c=0;c<N;c++) {
+        if (b[r][c]===EMPTY) continue;
+        const col=b[r][c];
+        for (const [dr,dc] of DIRS) {
+          let len=1,open=0;
+          for (let d=1;d<5;d++) {
+            const nr=r+dr*d,nc=c+dc*d;
+            if (nr<0||nr>=N||nc<0||nc>=N) break;
+            if (b[nr][nc]===col) len++;
+            else if (b[nr][nc]===EMPTY) { open++; break; }
+            else break;
+          }
+          const mult=col===color?1:-1;
+          if (len>=5) score+=mult*100000;
+          else if (len===4&&open>0) score+=mult*1000;
+          else if (len===3&&open>0) score+=mult*100;
+          else if (len===2&&open>0) score+=mult*10;
+        }
+      }
+      return score;
+    }
+
+    function getEmptyCells(b) {
+      const cells=[];
+      for (let r=0;r<N;r++) for (let c=0;c<N;c++) if (b[r][c]===EMPTY) cells.push([r,c]);
+      return cells;
+    }
+
+    // Get candidate moves near existing stones
+    function getCandidates(b) {
+      const candidates=new Set();
+      let hasStone=false;
+      for (let r=0;r<N;r++) for (let c=0;c<N;c++) {
+        if (b[r][c]===EMPTY) continue;
+        hasStone=true;
+        for (let dr=-2;dr<=2;dr++) for (let dc=-2;dc<=2;dc++) {
+          const nr=r+dr,nc=c+dc;
+          if (nr>=0&&nr<N&&nc>=0&&nc<N&&b[nr][nc]===EMPTY) candidates.add(nr*N+nc);
+        }
+      }
+      if (!hasStone) {
+        const mid=Math.floor(N/2);
+        candidates.add(mid*N+mid);
+      }
+      return [...candidates].map(k=>[Math.floor(k/N),k%N]);
+    }
+
+    function minimax(b, dep, alpha, beta, maximizing, aiCol) {
+      const cells=getEmptyCells(b);
+      // Check terminal
+      for (let r=0;r<N;r++) for (let c=0;c<N;c++) {
+        if (b[r][c]===EMPTY) continue;
+        const w=checkWin(b,r,c,b[r][c]);
+        if (w) return b[r][c]===aiCol?100000+dep:-100000-dep;
+      }
+      if (cells.length===0||dep===0) return scoreBoard(b,aiCol);
+
+      const candidates=getCandidates(b);
+      if (maximizing) {
+        let best=-Infinity;
+        for (const [r,c] of candidates) {
+          b[r][c]=aiCol;
+          const val=minimax(b,dep-1,alpha,beta,false,aiCol);
+          b[r][c]=EMPTY;
+          best=Math.max(best,val);
+          alpha=Math.max(alpha,val);
+          if (beta<=alpha) break;
+        }
+        return best;
+      } else {
+        let best=Infinity;
+        for (const [r,c] of candidates) {
+          b[r][c]=-aiCol;
+          const val=minimax(b,dep-1,alpha,beta,true,aiCol);
+          b[r][c]=EMPTY;
+          best=Math.min(best,val);
+          beta=Math.min(beta,val);
+          if (beta<=alpha) break;
+        }
+        return best;
+      }
+    }
+
+    function getAIMove(b, aiCol, dep) {
+      const candidates=getCandidates(b);
+      let bestVal=-Infinity, bestMove=candidates[0];
+      for (const [r,c] of candidates) {
+        b[r][c]=aiCol;
+        // Check immediate win
+        if (checkWin(b,r,c,aiCol)) { b[r][c]=EMPTY; return [r,c]; }
+        b[r][c]=EMPTY;
+        // Block opponent win
+        b[r][c]=-aiCol;
+        if (checkWin(b,r,c,-aiCol)) { b[r][c]=EMPTY; bestMove=[r,c]; bestVal=99999; }
+        else b[r][c]=EMPTY;
+      }
+      if (bestVal===99999) return bestMove;
+      for (const [r,c] of candidates) {
+        b[r][c]=aiCol;
+        const val=minimax(b,dep-1,-Infinity,Infinity,false,aiCol);
+        b[r][c]=EMPTY;
+        if (val>bestVal) { bestVal=val; bestMove=[r,c]; }
+      }
+      return bestMove;
+    }
+
+    function scheduleAI() {
+      if (gameOver||aiThinking) return;
+      aiThinking=true;
+      setStatus('<span class="thinking-dot">●</span><span class="thinking-dot" style="animation-delay:0.2s">●</span><span class="thinking-dot" style="animation-delay:0.4s">●</span> AI思考中…');
+      renderBoard();
+      setTimeout(()=>{
+        const [r,c]=getAIMove(board,aiColor,depth);
+        board[r][c]=aiColor;
+        const w=checkWin(board,r,c,aiColor);
+        aiThinking=false;
+        if (w) { winLine=w; gameOver=true; const name=aiColor===BLACK?'⬛ 黒':'⬜ 白'; setStatus(name+' AI の勝利！'); if(aiColor===BLACK)winBlack++;else winWhite++;saveStats();updateStats();}
+        else if (isFull(board)) { gameOver=true; setStatus('引き分け！'); }
+        else { currentTurn=-aiColor; updateTurnIndicator(); setStatus(''); }
+        renderBoard();
+      },30);
+    }
+
+    function onPlayerClick(r,c) {
+      if (gameOver||aiThinking||board[r][c]!==EMPTY||currentTurn!==playerColor) return;
+      board[r][c]=playerColor;
+      const w=checkWin(board,r,c,playerColor);
+      if (w) { winLine=w; gameOver=true; const name=playerColor===BLACK?'⬛ 黒':'⬜ 白'; setStatus(name+' あなたの勝利！'); if(playerColor===BLACK)winBlack++;else winWhite++;saveStats();updateStats();}
+      else if (isFull(board)) { gameOver=true; setStatus('引き分け！'); }
+      else { currentTurn=-playerColor; updateTurnIndicator(); scheduleAI(); }
+      renderBoard();
+    }
+
+    function updateTurnIndicator() {
+      document.getElementById('turn-box').textContent=currentTurn===BLACK?'⬛ の手番':'⬜ の手番';
+    }
+    function updateStats() {
+      document.getElementById('win-black').textContent=winBlack;
+      document.getElementById('win-white').textContent=winWhite;
+    }
+    function setStatus(html) { document.getElementById('status-msg').innerHTML=html; }
+
+    document.getElementById('btn-new').addEventListener('click',newGame);
+    loadStats();
+    newGame();
+  </script>
+</body>
+</html>
